@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Жвач v1.1 — mobile + touch</title>
+  <style>
+    html, body { height:100%; margin:0; background:#fcfcff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", Arial; touch-action: none; overflow:hidden; }
+    #hud { position:fixed; left:12px; top:12px; background:rgba(255,255,255,.9); padding:10px 12px; border-radius:12px; box-shadow:0 6px 20px rgba(0,0,0,.08); font-size:14px; line-height:1.35; z-index:10; }
+    #hud kbd { background:#f0f3ff; padding:2px 6px; border-radius:6px; border:1px solid #dfe6ff; font-size:12px }
+    #hud .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#ffe3ef; border:1px solid #ffc6db; font-weight:600; }
+    #hud .small { font-size:12px; opacity:.8 }
+    canvas { display:block; margin:0 auto; outline:none }
+    @media (pointer:coarse){ #hud{ font-size:13px } }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/matter-js@0.20.0/build/matter.min.js"></script>
+</head>
+<body>
+<div id="hud">
+  <div class="pill">Жвач — v1.1</div><br/>
+  Десктоп: <kbd>←</kbd><kbd>→</kbd> движение, <kbd>↑</kbd> прыжок, <kbd>S</kbd> супер‑липкость, <kbd>R</kbd> рестарт.<br/>
+  Мобайл: левый <b>джойстик</b> — движение, <b>тап по правой половине</b> — прыжок.
+</div>
+<script>
+(function(){
+  const { Engine, Render, Runner, World, Bodies, Body, Composite, Constraint, Events, Vector } = Matter;
+
+  // --- БАЗОВЫЕ НАСТРОЙКИ ---
+  const W = 960, H = 540; // внутренняя логическая 16:9
+  const engine = Engine.create();
+  const world = engine.world;
+  engine.positionIterations = 4; engine.velocityIterations = 3; engine.constraintIterations = 2; engine.gravity.y = 1.1;
+
+  const render = Render.create({
+    element: document.body,
+    engine,
+    options: { width: W, height: H, background:'#fbfbff', wireframes:false, pixelRatio:1, hasBounds:true }
+  });
+  Render.run(render);
+  Runner.run(Runner.create({ isFixed:true, delta:1000/60 }), engine);
+
+  // камера ограничена 16:9 и будет следовать за героем по Y
+  render.bounds.min = { x:0, y:0 };
+  render.bounds.max = { x:W, y:H };
+
+  // подгоняем канвас под экран (CSS масштаб)
+  function fitToScreen(){
+    const vw = window.innerWidth, vh = window.innerHeight, aspect = W/H;
+    let cw = vw, ch = Math.round(vw/aspect);
+    if (ch > vh) { ch = vh; cw = Math.round(vh*aspect); }
+    render.canvas.style.width = cw+"px";
+    render.canvas.style.height = ch+"px";
+  }
+  window.addEventListener('resize', fitToScreen, {passive:true});
+  window.addEventListener('orientationchange', fitToScreen);
+  fitToScreen();
+
+  // --- ГРАНИЦЫ ---
+  // Высокие, невидимые боковые стены, чтобы ничего не вываливалось
+  World.add(world, [
+    Bodies.rectangle(12, 50000, 24, 100000, { isStatic:true, render:{ visible:false } }),
+    Bodies.rectangle(W-12, 50000, 24, 100000, { isStatic:true, render:{ visible:false } })
+  ]);
+
+  // --- МОДУЛИ УРОВНЯ (бесконечный спуск) ---
+  const MOD_H = H; // высота одного модуля
+  let modules = []; // {i,type,yTop,yBottom,bodies}
+  let modulesSpawned = 0;
+
+  function spawnModule(i){
+    const type = (i % 2 === 0) ? 'blue' : 'green';
+    const yTop = i * MOD_H;
+    const yCenter = yTop + MOD_H * 0.5;
+    const bodies = [];
+    if (type === 'blue'){
+      // 1) синие стены, одна преграда по центру
+      bodies.push(Bodies.rectangle(W*0.5, yCenter, 220, 26, { isStatic:true, render:{ fillStyle:'#bcd1ff' } }));
+    } else {
+      // 2) зелёные стены, две преграды с боков
+      bodies.push(Bodies.rectangle(W*0.28, yCenter-60, 180, 24, { isStatic:true, angle: 0.15, render:{ fillStyle:'#bfe8c4' } }));
+      bodies.push(Bodies.rectangle(W*0.72, yCenter+60, 180, 24, { isStatic:true, angle:-0.15, render:{ fillStyle:'#bfe8c4' } }));
+    }
+    World.add(world, bodies);
+    modules.push({ i, type, yTop, yBottom: yTop + MOD_H, bodies });
+    modulesSpawned++;
+  }
+
+  function ensureModules(){
+    const needUpTo = Math.floor(gum.core.position.y / MOD_H) + 3;
+    while (modulesSpawned <= needUpTo) spawnModule(modulesSpawned);
+    // чистим наверху (старше камеры)
+    const minY = render.bounds.min.y;
+    for (const m of [...modules]){
+      if (m.yBottom < minY - 100){ World.remove(world, m.bodies); modules.splice(modules.indexOf(m),1); }
+    }
+  }
+
+  // --- ЖВАЧ (soft‑body) ---
+  function createGum(x, y, radius=58, segments=12){
+    const composite = Composite.create({ label:'GUM' });
+    const particles = []; const constraints = [];
+    const particleR = Math.max(6, Math.round(radius/9));
+    const core = Bodies.circle(x, y, Math.max(8, particleR+2), { label:'gum-core', frictionAir:0.02, render:{ visible:false } });
+    for (let i=0;i<segments;i++){
+      const a=(i/segments)*Math.PI*2; const px=x+Math.cos(a)*radius; const py=y+Math.sin(a)*radius;
+      particles.push(Bodies.circle(px,py,particleR,{ label:'gum-node', friction:0.3, restitution:0.15, frictionAir:0.015, collisionFilter:{group:-1}, render:{ visible:false } }));
+    }
+    const kEdge=0.3, damp=0.12;
+    for (let i=0;i<segments;i++){ const a=particles[i], b=particles[(i+1)%segments]; constraints.push(Constraint.create({ bodyA:a, bodyB:b, length:Vector.magnitude(Vector.sub(a.position,b.position)), stiffness:kEdge, damping:damp })); }
+    const kRad=0.22; for (let i=0;i<segments;i++){ const p=particles[i]; constraints.push(Constraint.create({ bodyA:p, bodyB:core, length:Vector.magnitude(Vector.sub(p.position,core.position)), stiffness:kRad, damping:0.1 })); }
+    const kDiag=0.05; for (let i=0;i<segments;i+=3){ const a=particles[i], b=particles[(i+3)%segments]; constraints.push(Constraint.create({ bodyA:a, bodyB:b, length:Vector.magnitude(Vector.sub(a.position,b.position)), stiffness:kDiag, damping:0.08 })); }
+    Composite.add(composite, [core, ...particles, ...constraints]);
+    const stickyJoints = new Set();
+    return { composite, core, particles, constraints, stickyJoints };
+  }
+  let gum = createGum(W*0.2, H*0.2, 58, 12); World.add(world, gum.composite);
+
+  // --- ЛИПКИЕ СОЕДИНЕНИЯ ---
+  const lastStickyById = new Map(); let stickyCount = 0; const MAX_STICKY=18, STICKY_COOLDOWN=250;
+  function attachSticky(p, point, lifeMs=600){ if(stickyCount>=MAX_STICKY) return; const anchor=Bodies.circle(point.x,point.y,2,{isStatic:true,render:{visible:false}}); const joint=Constraint.create({ bodyA:p, bodyB:anchor, length:0, stiffness:0.5, damping:0.25 }); World.add(world,[anchor,joint]); const rec={ anchor, joint, born:performance.now(), life:lifeMs }; gum.stickyJoints.add(rec); stickyCount++; }
+  function clearSticky(rec){ if(!rec) return; World.remove(world,rec.joint); World.remove(world,rec.anchor); gum.stickyJoints.delete(rec); stickyCount=Math.max(0,stickyCount-1); }
+  function maybeStick(nodeBody, pair){ const now=performance.now(); const last=lastStickyById.get(nodeBody.id)||0; if(now-last<STICKY_COOLDOWN||stickyCount>=MAX_STICKY) return; const v=Vector.magnitude(nodeBody.velocity); if(v<1.7||superSticky.on){ const sp=pair.collision.supports&&pair.collision.supports[0]?pair.collision.supports[0]:nodeBody.position; attachSticky(nodeBody, sp, 700); lastStickyById.set(nodeBody.id, now);} }
+  Events.on(engine,'collisionStart',ev=>{ for(const pair of ev.pairs){ const a=pair.bodyA,b=pair.bodyB; if(a.label==='gum-node'&&b.isStatic) maybeStick(a,pair); if(b.label==='gum-node'&&a.isStatic) maybeStick(b,pair); } });
+  let superSticky={ on:false, until:0 }; function pulseSuperSticky(ms=550){ superSticky.on=true; superSticky.until=performance.now()+ms; }
+
+  // --- УПРАВЛЕНИЕ: клавиатура + тач‑джойстик ---
+  const MOVE=0.0016, AIR_MOVE=0.0012, JUMP=0.045; const keys={ left:false, right:false };
+  function applyToCore(fx,fy){ Body.applyForce(gum.core, gum.core.position, {x:fx, y:fy}); }
+  let jumpReadyAt=0; function tryJump(){ const now=performance.now(); if(now<jumpReadyAt) return; applyToCore(0,-JUMP); jumpReadyAt=now+160; }
+  window.addEventListener('keydown',e=>{ if(['ArrowLeft','ArrowRight','ArrowUp'].includes(e.code)) e.preventDefault(); if(e.code==='ArrowLeft')keys.left=true; if(e.code==='ArrowRight')keys.right=true; if(e.code==='ArrowUp')tryJump(); if(e.code==='KeyS')pulseSuperSticky(); if(e.code==='KeyR')reset(); });
+  window.addEventListener('keyup',e=>{ if(['ArrowLeft','ArrowRight','ArrowUp'].includes(e.code)) e.preventDefault(); if(e.code==='ArrowLeft')keys.left=false; if(e.code==='ArrowRight')keys.right=false; });
+
+  const joy={ active:false, id:null, baseX:90, baseY:H-90, curX:90, curY:H-90, r:70, axisX:0 };
+  function clamp(v,min,max){ return v<min?min:(v>max?max:v); }
+  function toCanvasCoords(t){ const rect=render.canvas.getBoundingClientRect(); const x=(t.clientX-rect.left)*(render.options.width/rect.width); const y=(t.clientY-rect.top)*(render.options.height/rect.height); return {x,y}; }
+  function updateJoy(p){ const dx=p.x-joy.baseX, dy=p.y-joy.baseY; const dist=Math.hypot(dx,dy), max=joy.r, k=dist>max?max/dist:1; joy.curX=joy.baseX+dx*k; joy.curY=joy.baseY+dy*k; joy.axisX=clamp((joy.curX-joy.baseX)/max,-1,1); }
+  function endJoy(){ joy.active=false; joy.id=null; joy.curX=joy.baseX; joy.curY=joy.baseY; joy.axisX=0; }
+  const cvs=()=>render.canvas;
+  cvs().addEventListener('touchstart',e=>{ e.preventDefault(); for(const t of e.changedTouches){ const p=toCanvasCoords(t); const onLeftBottom=(p.x<render.options.width*0.55 && p.y>render.options.height*0.45); if(!joy.active && onLeftBottom){ joy.active=true; joy.id=t.identifier; updateJoy(p);} else { tryJump(); } } },{passive:false});
+  cvs().addEventListener('touchmove',e=>{ e.preventDefault(); for(const t of e.changedTouches){ if(joy.active && t.identifier===joy.id) updateJoy(toCanvasCoords(t)); } },{passive:false});
+  function endTouch(e){ e.preventDefault(); for(const t of e.changedTouches){ if(joy.active && t.identifier===joy.id) endJoy(); } }
+  cvs().addEventListener('touchend', endTouch, {passive:false});
+  cvs().addEventListener('touchcancel', endTouch, {passive:false});
+
+  // --- ИГРОВОЙ ЦИКЛ ---
+  Events.on(engine,'beforeUpdate',()=>{
+    const now=performance.now();
+    for(const rec of [...gum.stickyJoints]){ const a=rec.joint.bodyA.position, b=rec.joint.bodyB.position; const dist=Vector.magnitude(Vector.sub(a,b)); if(now-rec.born>rec.life || dist>70) clearSticky(rec); }
+    if(superSticky.on && now>superSticky.until) superSticky.on=false;
+
+    // камера: держим героя по центру
+    const centerY=(render.bounds.min.y+render.bounds.max.y)*0.5; const targetY=gum.core.position.y; const dy=targetY-centerY; render.bounds.min.y+=dy; render.bounds.max.y+=dy;
+
+    // генерим/чистим модули
+    ensureModules();
+
+    // движение (клава + джойстик)
+    const onGround = gum.core.position.y > H-60; const f = onGround?MOVE:AIR_MOVE;
+    let axis=0; if(keys.left)axis-=1; if(keys.right)axis+=1; axis+=joy.axisX; axis=clamp(axis,-1,1); if(Math.abs(axis)>0.01) applyToCore(f*axis,0);
+  });
+
+  // расплющивание на удар
+  let softenUntil=0;
+  Events.on(engine,'collisionStart',ev=>{
+    for(const pair of ev.pairs){
+      if((pair.bodyA===gum.core||pair.bodyB===gum.core)|| pair.bodyA.label==='gum-node'||pair.bodyB.label==='gum-node'){
+        const relVx=(pair.bodyA.velocity.x-pair.bodyB.velocity.x), relVy=(pair.bodyA.velocity.y-pair.bodyB.velocity.y);
+        const impactV=Math.sqrt(relVx*relVx+relVy*relVy);
+        const depth = pair.collision && pair.collision.depth ? pair.collision.depth : 0;
+        const impact = impactV + depth*8;
+        if(impact>3) softenUntil=performance.now()+220;
+      }
+    }
+  });
+  Events.on(engine,'beforeUpdate',()=>{
+    const now=performance.now();
+    for(const c of gum.constraints){
+      if(c.bodyB===gum.core){ c.stiffness = now<softenUntil?0.12:0.22; c.damping = now<softenUntil?0.22:0.1; }
+      if(superSticky.on && c.bodyB!==gum.core){ c.damping=0.2; }
+    }
+  });
+
+  function reset(){ World.remove(world, gum.composite); gum=createGum(W*0.2,H*0.2,58,12); World.add(world, gum.composite); }
+
+  // --- ХЕЛПЕР ОТРИСОВКИ: мир → экран ---
+  function worldToScreen(v){ const b=render.bounds; const sX=render.options.width/(b.max.x-b.min.x), sY=render.options.height/(b.max.y-b.min.y); return { x:(v.x-b.min.x)*sX, y:(v.y-b.min.y)*sY, sX, sY }; }
+
+  // --- ПОСТ‑РЕНДЕР: стены (декор), «оболочка», лицо, джойстик ---
+  Events.on(render,'afterRender',()=>{
+    const ctx=render.context; const b=render.bounds; const height=render.options.height; const sX=render.options.width/(b.max.x-b.min.x); const sY=render.options.height/(b.max.y-b.min.y); const avgScale=(sX+sY)*0.5;
+
+    // цвет стен по модулю
+    const currentIdx=Math.floor(gum.core.position.y/H); const type=(currentIdx%2===0)?'blue':'green'; const wallColor=(type==='blue')?'#d6e1ff':'#d9f4df';
+    ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.fillStyle=wallColor; const wallW=24*sX; ctx.fillRect(0,0,wallW,height); ctx.fillRect(render.options.width-wallW,0,wallW,height); ctx.restore();
+
+    // оболочка жвачки
+    const ptsW=gum.particles.map(p=>p.position); const pts=ptsW.map(worldToScreen); const ctrW=gum.core.position; const ctrS=worldToScreen(ctrW);
+    if(pts.length>2){
+      ctx.save(); ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y); for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x, pts[i].y); ctx.closePath();
+      let avgR=0; for(let i=0;i<ptsW.length;i++){ const dx=ptsW[i].x-ctrW.x, dy=ptsW[i].y-ctrW.y; avgR+=Math.hypot(dx,dy);} avgR/=ptsW.length; const sr=avgR*avgScale;
+      const g=ctx.createRadialGradient(ctrS.x-sr*0.15, ctrS.y-sr*0.25, sr*0.1, ctrS.x, ctrS.y, sr); g.addColorStop(0,'#ffd3e5'); g.addColorStop(0.6,'#ff9ec2'); g.addColorStop(1,'#ff87b4'); ctx.fillStyle=g; ctx.fill();
+      ctx.lineJoin='round'; ctx.miterLimit=2; ctx.lineWidth=6; ctx.strokeStyle='#ff9dbf'; ctx.stroke();
+      ctx.globalAlpha=0.22; ctx.beginPath(); ctx.ellipse(ctrS.x-sr*0.25, ctrS.y-sr*0.35, sr*0.45, sr*0.25, -0.2, 0, Math.PI*2); ctx.fillStyle='#fff'; ctx.fill(); ctx.globalAlpha=1; ctx.restore();
+    }
+
+    // лицо
+    ctx.save(); const eyeOffset=14*avgScale, eyeR=7*avgScale, pupilR=3.2*avgScale; ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(ctrS.x-eyeOffset, ctrS.y-10*avgScale, eyeR, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(ctrS.x+eyeOffset, ctrS.y-10*avgScale, eyeR, 0, Math.PI*2); ctx.fill(); ctx.fillStyle='#111'; ctx.beginPath(); ctx.arc(ctrS.x-eyeOffset+2*avgScale, ctrS.y-12*avgScale, pupilR, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(ctrS.x+eyeOffset+1*avgScale, ctrS.y-12*avgScale, pupilR, 0, Math.PI*2); ctx.fill(); ctx.strokeStyle='#78324d'; ctx.lineWidth=2*avgScale; ctx.beginPath(); ctx.arc(ctrS.x, ctrS.y, 10*avgScale, 0.15*Math.PI, 0.85*Math.PI); ctx.stroke(); ctx.restore();
+
+    // джойстик (экранные координаты)
+    const ctx2=render.context; ctx2.save(); ctx2.setTransform(1,0,0,1,0,0); ctx2.globalAlpha=0.12; ctx2.beginPath(); ctx2.arc(joy.baseX, joy.baseY, joy.r, 0, Math.PI*2); ctx2.fillStyle='#000'; ctx2.fill(); ctx2.globalAlpha=0.35; ctx2.beginPath(); ctx2.arc(joy.curX, joy.curY, joy.r*0.35, 0, Math.PI*2); ctx2.fillStyle='#000'; ctx2.fill(); ctx2.globalAlpha=1; ctx2.restore();
+  });
+
+  // пара коробок для столкновений (оставил для фан‑эффектов)
+  for(let i=0;i<4;i++){ const b=Bodies.rectangle(540+i*60, 60+i*5, 36, 36, { restitution:0.2, friction:0.25, render:{ fillStyle:'#ffd8e7' } }); World.add(world, b); }
+})();
+</script>
+</body>
+</html>
